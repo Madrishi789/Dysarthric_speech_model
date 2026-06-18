@@ -67,22 +67,30 @@ def load_and_preprocess(filepath):
     return waveform
 
 def get_trimmed_length(filepath):
-    return len(load_and_preprocess(filepath))
+    try:
+        return len(load_and_preprocess(filepath))
+    except:
+        return 0
 
 train_df = train_df[train_df["path"].apply(lambda p: get_trimmed_length(p) >= MIN_SAMPLES)].reset_index(drop=True)
 test_df  = test_df[test_df["path"].apply(lambda p: get_trimmed_length(p) >= MIN_SAMPLES)].reset_index(drop=True)
+print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
 
 # ── Vocabulary ────────────────────────────────────────────────────────
+# FIX: [PAD] MUST be at index 0 — CTC uses index 0 as the blank token
 all_words = train_df["word"].tolist() + test_df["word"].tolist()
 all_chars = sorted(set("".join(all_words)))
-vocab = {char: idx for idx, char in enumerate(all_chars)}
-vocab["[PAD]"] = len(vocab)
+
+vocab = {"[PAD]": 0}  # blank/pad at index 0
+for idx, char in enumerate(all_chars, start=1):
+    vocab[char] = idx
 vocab["[UNK]"] = len(vocab)
 vocab["|"]     = len(vocab)
 
 os.makedirs("model", exist_ok=True)
 with open("model/vocab.json", "w") as f:
     json.dump(vocab, f)
+print(f"Vocab size: {len(vocab)}, PAD at index: {vocab['[PAD]']}")
 
 # ── Processor ─────────────────────────────────────────────────────────
 tokenizer = Wav2Vec2CTCTokenizer(
@@ -130,33 +138,54 @@ test_dataset  = UASpeechDataset(test_df,  processor)
 data_collator = DataCollatorCTCWithPadding(processor=processor)
 
 # ── Model ─────────────────────────────────────────────────────────────
-model = HubertForCTC.from_pretrained("facebook/hubert-base-ls960", ignore_mismatched_sizes=True)
-model.lm_head = nn.Linear(768, len(processor.tokenizer), bias=True)
+VOCAB_SIZE = len(processor.tokenizer)
+
+model = HubertForCTC.from_pretrained(
+    "facebook/hubert-base-ls960",
+    ctc_loss_reduction="mean",
+    pad_token_id=processor.tokenizer.pad_token_id,  # 0
+    ignore_mismatched_sizes=True
+)
+
+# Replace LM head with correct vocab size
+model.lm_head = nn.Linear(768, VOCAB_SIZE, bias=True)
 nn.init.normal_(model.lm_head.weight, mean=0.0, std=0.02)
 nn.init.zeros_(model.lm_head.bias)
-model.config.vocab_size        = len(processor.tokenizer)
+model.config.vocab_size = VOCAB_SIZE
+model.config.pad_token_id = 0
+
+# FIX: Freeze feature extractor CNN — prevents unstable early training
+model.hubert.feature_extractor._freeze_parameters()
+
+# FIX: Disable SpecAugment masking for fine-tuning
 model.config.mask_time_prob    = 0.0
 model.config.mask_feature_prob = 0.0
-for param in model.parameters():
-    param.requires_grad = True
-model = model.to("cuda")
+
+# Enable gradient checkpointing for memory efficiency
+model.gradient_checkpointing_enable()
+
+model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {next(model.parameters()).device}")
+print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # ── Training ──────────────────────────────────────────────────────────
 training_args = TrainingArguments(
     output_dir="model/checkpoints",
-    group_by_length=False,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=8,
-    eval_strategy="no",
-    num_train_epochs=10,
-    fp16=True,
-    learning_rate=1e-4,
-    warmup_steps=500,
-    weight_decay=0.005,
+    group_by_length=True,               # FIX: group similar lengths to reduce padding waste
+    per_device_train_batch_size=4,       # FIX: larger batch for more stable gradients
+    gradient_accumulation_steps=4,       # effective batch = 16
+    eval_strategy="epoch",
+    num_train_epochs=30,                 # FIX: more epochs — dysarthric data is small
+    fp16=torch.cuda.is_available(),
+    learning_rate=3e-5,                  # FIX: lower LR for pretrained encoder
+    warmup_ratio=0.1,                    # FIX: warmup as ratio, not fixed steps
+    weight_decay=0.01,
     lr_scheduler_type="cosine",
     save_strategy="epoch",
-    save_total_limit=2,
-    logging_steps=50,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="loss",
+    logging_steps=25,
     report_to="none",
     dataloader_num_workers=2,
 )
